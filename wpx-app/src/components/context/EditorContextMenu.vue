@@ -2,7 +2,11 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { computePosition, flip, offset, shift } from '@floating-ui/dom'
 import { useThemeStore } from '@/stores/theme'
-import { plainTextToEditableHtml } from '@/composables/useHtmlImporter'
+import {
+  plainTextToEditableHtml,
+  splitInlineFirstHtml,
+  insertInlineFirstContent,
+} from '@/composables/useHtmlImporter'
 
 const props = defineProps({
   open: {
@@ -80,11 +84,17 @@ async function handlePaste() {
   try {
     const text = await navigator.clipboard.readText()
     if (text) {
-      // 纯文本需转换为段落/换行结构后再插入：
-      // 直接 insertContent(text) 会把 \n 作为字面量塞进单个文本节点，
-      // 导致换行视觉丢失、导出 markdown 时换行数量错乱。
+      // 纯文本先规范化（\n → 段落/<br> 结构），再「内联优先」插入：
+      // 首行直接跟在光标后面不换行，其余段落跟在后面
       const html = plainTextToEditableHtml(text)
-      ed.chain().focus().insertContent(html || text).run()
+      const { from, to } = ed.state.selection
+      if (html) {
+        const { inlineJson, restHtml } = splitInlineFirstHtml(html)
+        ed.chain().focus().run()
+        insertInlineFirstContent(ed, { from, to }, inlineJson, restHtml)
+      } else {
+        ed.chain().focus().insertContentAt({ from, to }, text).run()
+      }
     }
   } catch {
     document.execCommand('paste')

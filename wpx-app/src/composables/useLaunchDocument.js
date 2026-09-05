@@ -1,5 +1,5 @@
 import { onMounted } from 'vue'
-import { loadEditorDraft } from '@/composables/useAutoSave'
+import { isDraftContentMeaningful, loadEditorDraft } from '@/composables/useAutoSave'
 import { useGeneralSettingsStore } from '@/stores/generalSettings'
 import {
   getDocPathFromUrl,
@@ -63,11 +63,19 @@ export function useLaunchDocument({ onOpen, onBlank, onAiIntent, onTemplate }) {
 
     if (generalSettings.startupBehavior === 'restore-last') {
       const draft = loadEditorDraft()
-      if (draft?.content) {
+      // 只恢复「有意义」的草稿：单个字符 / 纯空白 / 纯标点等
+      // 测试残留内容不恢复，保证打开是干净的空白文档
+      if (draft?.content && isDraftContentMeaningful(draft.content)) {
         onOpen({
           content: draft.content,
           title: draft.title,
         })
+        return
+      }
+      // 存在草稿但内容无意义：视为无草稿，直接进入空白文档
+      // （不落回首页空态，符合「打开即空白可编辑」的预期）
+      if (draft?.content && getWindowId() === 0) {
+        onBlank?.()
         return
       }
     }

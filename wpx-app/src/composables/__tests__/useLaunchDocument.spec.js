@@ -29,15 +29,19 @@ vi.mock('@/utils/windowContext', () => ({
   isEditorRoute: (route) => route?.name === 'editor',
 }))
 
-// mock useAutoSave：返回空草稿
-vi.mock('@/composables/useAutoSave', () => ({
-  loadEditorDraft: () => null,
-  EDITOR_DRAFT_STORAGE_KEY: 'wpx-editor-draft',
-  useAutoSave: () => ({
-    scheduleAutoSave: vi.fn(),
-    flushDraft: vi.fn(),
-  }),
-}))
+// mock useAutoSave：loadEditorDraft 返回可控草稿；isDraftContentMeaningful 用真实实现
+const draftState = { value: null }
+vi.mock('@/composables/useAutoSave', async (importOriginal) => {
+  const actual = await importOriginal()
+  return {
+    ...actual,
+    loadEditorDraft: () => draftState.value,
+    useAutoSave: () => ({
+      scheduleAutoSave: vi.fn(),
+      flushDraft: vi.fn(),
+    }),
+  }
+})
 
 // mock launchDocument：返回 null（无文件）
 vi.mock('@/utils/launchDocument', () => ({
@@ -69,6 +73,7 @@ beforeEach(() => {
   urlState.intent = ''
   urlState.templateId = ''
   urlState.windowId = 0
+  draftState.value = null
 })
 
 describe('useLaunchDocument', () => {
@@ -180,5 +185,74 @@ describe('useLaunchDocument', () => {
 
     expect(onBlank).toHaveBeenCalledTimes(1)
     expect(onOpen).not.toHaveBeenCalled()
+  })
+
+  // ===== 无意义草稿不恢复（本次 bug 修复） =====
+
+  it('草稿为单个字符"1"：不恢复，直接 onBlank（修复「打开出现 1」）', async () => {
+    urlState.mode = 'normal'
+    urlState.windowId = 0
+    draftState.value = { content: '1', title: '未命名文档', updatedAt: 1 }
+    const onOpen = vi.fn()
+    const onBlank = vi.fn()
+    mountWith({ onOpen, onBlank })
+
+    await nextTick()
+    await nextTick()
+
+    expect(onOpen).not.toHaveBeenCalled()
+    expect(onBlank).toHaveBeenCalledTimes(1)
+  })
+
+  it('草稿为纯空白/零宽字符：不恢复，直接 onBlank', async () => {
+    urlState.mode = 'normal'
+    urlState.windowId = 0
+    draftState.value = { content: '\u200B\n\n  \n', title: '未命名文档' }
+    const onOpen = vi.fn()
+    const onBlank = vi.fn()
+    mountWith({ onOpen, onBlank })
+
+    await nextTick()
+    await nextTick()
+
+    expect(onOpen).not.toHaveBeenCalled()
+    expect(onBlank).toHaveBeenCalledTimes(1)
+  })
+
+  it('草稿为有意义内容：正常恢复（行为不变）', async () => {
+    urlState.mode = 'normal'
+    urlState.windowId = 0
+    draftState.value = {
+      content: '# 会议记录\n\n今天讨论了发布计划',
+      title: '会议记录',
+    }
+    const onOpen = vi.fn()
+    const onBlank = vi.fn()
+    mountWith({ onOpen, onBlank })
+
+    await nextTick()
+    await nextTick()
+
+    expect(onOpen).toHaveBeenCalledTimes(1)
+    expect(onOpen).toHaveBeenCalledWith({
+      content: '# 会议记录\n\n今天讨论了发布计划',
+      title: '会议记录',
+    })
+    expect(onBlank).not.toHaveBeenCalled()
+  })
+
+  it('无意义草稿 + windowId>0：仍走 onBlank（不重复调用）', async () => {
+    urlState.mode = 'normal'
+    urlState.windowId = 3
+    draftState.value = { content: 'x', title: '未命名文档' }
+    const onOpen = vi.fn()
+    const onBlank = vi.fn()
+    mountWith({ onOpen, onBlank })
+
+    await nextTick()
+    await nextTick()
+
+    expect(onOpen).not.toHaveBeenCalled()
+    expect(onBlank).toHaveBeenCalledTimes(1)
   })
 })

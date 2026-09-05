@@ -277,6 +277,194 @@ export function pastedHtmlHasVisibleContent(html) {
   return withoutTags.replace(/\u00A0/g, ' ').replace(ZERO_WIDTH_RE, '').trim() !== ''
 }
 
+/* ---------------------------------------------------------------------------
+ * 「内联优先」插入（粘贴不换行）
+ *
+ * 需求：粘贴的内容直接追加到光标后面，不要先换行。
+ * 根因：剪贴板 HTML 的内容几乎都包在 <div>/<p> 块级标签里，insertContentAt
+ * 插入块级内容必然在光标处拆段 → 内容出现在新行。
+ * 方案：把粘贴内容拆成「首块内联 JSON + 其余块 HTML」：
+ *   - 首个简单块（纯内联内容的 p/div/h）解包成内联节点（保留 bold/italic/
+ *     underline/strike/code/link/color 标记），以 Fragment 形式插到光标处 → 不换行
+ *   - 其余块级内容仍作为块插入（跟在首行后面），多段结构不丢
+ *   - 纯文本路径复用同一机制：首行内联、其余分段
+ * ------------------------------------------------------------------------- */
+
+/** 内联格式标签 → Tiptap mark 类型（均为项目已注册扩展） */
+const INLINE_MARK_TAG_MAP = {
+  B: 'bold',
+  STRONG: 'bold',
+  EM: 'italic',
+  I: 'italic',
+  U: 'underline',
+  INS: 'underline',
+  S: 'strike',
+  STRIKE: 'strike',
+  DEL: 'strike',
+  CODE: 'code',
+}
+
+/** 顶层块级元素判定（含媒体；出现即不能整体内联） */
+const BLOCKISH_TAG_RE =
+  /^(P|DIV|H[1-6]|UL|OL|LI|DL|DT|DD|TABLE|THEAD|TBODY|TR|TD|TH|PRE|BLOCKQUOTE|HR|IMG|VIDEO|AUDIO|IFRAME|SVG|CANVAS|SECTION|ARTICLE|ASIDE|MAIN|NAV|FIGURE|FIGCAPTION|HEADER|FOOTER|DETAILS|SUMMARY)$/
+
+/** 从 style 属性提取颜色（color: rgb(...)/#hex） */
+function parseStyleColor(el) {
+  const style = el.getAttribute?.('style') || ''
+  const m = style.match(/(?:^|;)\s*color\s*:\s*([^;]+)/i)
+  if (!m) return null
+  return m[1].trim() || null
+}
+
+/**
+ * DOM 节点列表 → Tiptap 内联 JSON 数组（text / hardBreak，携带 marks）。
+ * 未知标签透明递归（保留其文本与已知格式后代）。
+ * @param {NodeList | Node[]} nodes
+ * @param {object[]} inheritedMarks
+ * @returns {object[]}
+ */
+function nodesToInlineJson(nodes, inheritedMarks = []) {
+  const out = []
+  for (const node of nodes) {
+    if (node.nodeType === 3 /* TEXT */) {
+      const text = (node.textContent || '').replace(ZERO_WIDTH_RE, '')
+      if (text) {
+        out.push({ type: 'text', text, ...(inheritedMarks.length ? { marks: [...inheritedMarks] } : {}) })
+      }
+      continue
+    }
+    if (node.nodeType !== 1 /* ELEMENT */) continue
+
+    const tag = node.tagName
+    if (tag === 'BR') {
+      out.push({ type: 'hardBreak' })
+      continue
+    }
+    if (tag === 'A') {
+      const href = node.getAttribute('href') || ''
+      if (href) {
+        out.push(...nodesToInlineJson(node.childNodes, [...inheritedMarks, { type: 'link', attrs: { href } }]))
+        continue
+      }
+    }
+    if (tag === 'SPAN' || tag === 'FONT') {
+      const color = parseStyleColor(node)
+      if (color) {
+        out.push(...nodesToInlineJson(node.childNodes, [...inheritedMarks, { type: 'color', attrs: { color } }]))
+        continue
+      }
+    }
+    const markType = INLINE_MARK_TAG_MAP[tag]
+    if (markType) {
+      out.push(...nodesToInlineJson(node.childNodes, [...inheritedMarks, { type: markType }]))
+      continue
+    }
+    // 未知内联标签：透明递归（保文本）
+    out.push(...nodesToInlineJson(node.childNodes, inheritedMarks))
+  }
+  return out
+}
+
+/** 块是否为「简单块」：自身是块级标签，但后代全是内联内容（无块/无媒体） */
+function isSimpleInlineBlock(el) {
+  return !el.querySelector(
+    'p,div,h1,h2,h3,h4,h5,h6,ul,ol,li,dl,dt,dd,table,thead,tbody,tr,td,th,pre,blockquote,hr,img,video,audio,iframe,svg,canvas,section,article,aside,main,nav,figure,figcaption,header,footer',
+  )
+}
+
+/**
+ * 把（已清洗的）粘贴 HTML 拆成「首块内联 JSON + 其余块 HTML」。
+ *
+ * 规则：
+ *  - 顶层无块级元素 → 全部转内联 JSON（restHtml 为空）
+ *  - 首个块级元素是简单块（p/div/h1-6 等，只含内联内容）→ 解包为内联 JSON，
+ *    其后的顶层节点归入 restHtml
+ *  - 首个块级元素不简单（列表/表格/图片块等）→ inlineJson 只含其前的顶层
+ *    文本（通常为空），全部内容归入 restHtml（保持块级结构插入）
+ *
+ * @param {string | null | undefined} html
+ * @returns {{ inlineJson: object[], restHtml: string }}
+ */
+export function splitInlineFirstHtml(html) {
+  const result = { inlineJson: [], restHtml: '' }
+  if (!html || typeof html !== 'string') return result
+  if (typeof document === 'undefined') {
+    // 无 DOM 环境：退化为整体块级插入
+    result.restHtml = html
+    return result
+  }
+
+  let template
+  try {
+    template = document.createElement('template')
+    template.innerHTML = html
+  } catch (e) {
+    result.restHtml = html
+    return result
+  }
+
+  const topNodes = [...template.content.childNodes]
+  const firstBlock = topNodes.find((n) => n.nodeType === 1 && BLOCKISH_TAG_RE.test(n.tagName))
+
+  if (!firstBlock) {
+    // 顶层全是内联内容 → 整体内联
+    result.inlineJson = nodesToInlineJson(topNodes)
+    return result
+  }
+
+  const idx = topNodes.indexOf(firstBlock)
+  const before = topNodes.slice(0, idx)
+  const after = topNodes.slice(idx + 1)
+
+  if (isSimpleInlineBlock(firstBlock)) {
+    // 首块解包：内联部分 = 首块内容 + 其前面的顶层文本
+    result.inlineJson = [
+      ...nodesToInlineJson(before),
+      ...nodesToInlineJson(firstBlock.childNodes),
+    ]
+  } else {
+    // 首块承载结构（列表/表格等）：内联部分只有其前的顶层文本（通常为空）
+    result.inlineJson = nodesToInlineJson(before)
+  }
+
+  // restHtml = 首块（若未解包）+ 其后的顶层节点
+  const wrapper = document.createElement('div')
+  if (!isSimpleInlineBlock(firstBlock)) {
+    // eslint-disable-next-line no-console
+    wrapper.appendChild(firstBlock.cloneNode(true))
+  }
+  for (const n of after) wrapper.appendChild(n.cloneNode(true))
+  result.restHtml = wrapper.innerHTML
+  return result
+}
+
+/**
+ * 按「内联优先」语义把粘贴内容插入编辑器：
+ *   1. restHtml（块级部分）先插入到粘贴时的光标范围
+ *   2. inlineJson（首行内联部分）再插入到光标处 —— 最终顺序：
+ *      光标前文 + 内联首行 + 其余块级段落 + 光标后文
+ *
+ * 单块/单行内容（restHtml 为空）只走第 2 步 → 完全不换行。
+ *
+ * @param {object} editor Tiptap Editor 实例
+ * @param {{from: number, to: number}} range 粘贴事件发生时的光标/选区
+ * @param {object[]} inlineJson
+ * @param {string} restHtml
+ */
+export function insertInlineFirstContent(editor, range, inlineJson, restHtml) {
+  if (!editor) return
+  const hasInline = Array.isArray(inlineJson) && inlineJson.length > 0
+
+  if (restHtml) {
+    editor.chain().insertContentAt(range, restHtml).run()
+    if (hasInline) {
+      editor.chain().insertContentAt({ from: range.from, to: range.from }, inlineJson).run()
+    }
+  } else if (hasInline) {
+    editor.chain().insertContentAt(range, inlineJson).run()
+  }
+}
+
 /**
  * 把纯文本转换为可插入编辑器的 HTML 片段（右键菜单「粘贴」用）。
  *
@@ -293,7 +481,10 @@ export function plainTextToEditableHtml(text) {
   if (!text || typeof text !== 'string') return ''
 
   // 统一 Windows/Mac 换行符；去掉首尾空行（粘贴时不产生多余空段落）
-  const normalized = text.replace(/\r\n?/g, '\n').replace(/^\n+|\n+$/g, '')
+  const normalized = text
+    .replace(/\r\n?/g, '\n')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/^\n+|\n+$/g, '')
   if (!normalized) return ''
 
   const escapeHtmlText = (s) =>
@@ -554,6 +745,8 @@ export function useHtmlImporter() {
     sanitizePastedHtml,
     plainTextToEditableHtml,
     pastedHtmlHasVisibleContent,
+    splitInlineFirstHtml,
+    insertInlineFirstContent,
   }
 }
 
@@ -572,5 +765,7 @@ export default {
   sanitizePastedHtml,
   plainTextToEditableHtml,
   pastedHtmlHasVisibleContent,
+  splitInlineFirstHtml,
+  insertInlineFirstContent,
   MAX_HTML_SOURCE_BYTES,
 }

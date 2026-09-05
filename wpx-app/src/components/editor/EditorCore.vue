@@ -51,6 +51,9 @@ import {
   hasHtmlImport,
   sanitizePastedHtml,
   pastedHtmlHasVisibleContent,
+  plainTextToEditableHtml,
+  splitInlineFirstHtml,
+  insertInlineFirstContent,
 } from '@/composables/useHtmlImporter'
 import { useHtmlFormatPromptStore } from '@/stores/htmlFormatPrompt'
 import { getSanitizedJson } from '@/utils/exportAttrsFilter'
@@ -275,7 +278,14 @@ const editor = useEditor({
         return true
       },
     },
-    handlePaste: (_view, event) => {
+    handlePaste: (view, event) => {
+      // 在粘贴入口记录光标/选区范围，后续所有分支都显式插入到这个位置，
+      // 保证「粘贴内容追加到光标后面」。
+      // 不使用 chain().focus()：focus() 在部分时机会重置选区（拉回旧位置），
+      // 导致内容插到文档开头/别处而非光标处；粘贴事件本身已保证编辑器有焦点。
+      const pasteSelection = view.state.selection
+      const pasteRange = { from: pasteSelection.from, to: pasteSelection.to }
+
       const items = event.clipboardData?.items
       if (!items) return false
 
@@ -313,20 +323,19 @@ const editor = useEditor({
         }
         try {
           // 在光标位置插入 HTML，保留文档原有内容
-          // 注意：必须使用完整可选链避免 editor.value 为 null 时抛 TypeError
-          // 先清洗再插入：去除段尾 <br>、空段落、嵌套内联包裹的空白（&nbsp; 段）等噪音，
-          // 避免「粘贴后多出多个换行符/大片空白」（详见 useHtmlImporter.sanitizePastedHtml）
+          // 先清洗再插入：去除段尾 <br>、空段落、嵌套内联包裹的空白（&nbsp; 段）等噪音
+          // （详见 useHtmlImporter.sanitizePastedHtml）
           const cleanedHtml = sanitizePastedHtml(htmlContent)
           if (!pastedHtmlHasVisibleContent(cleanedHtml)) {
             // 粘贴内容全是空白（空段落/nbsp/零宽字符）：静默吞掉，
             // 不插入任何内容、不写 htmlSource、不弹「已插入」提示
             return true
           }
-          editor.value
-            ?.chain()
-            ?.focus()
-            ?.insertContent(cleanedHtml)
-            ?.run()
+          // 「内联优先」插入：首块内容解包为内联（保留加粗/斜体/链接等格式），
+          // 直接追加到光标后面不换行；其余段落作为块级内容跟在首行后面。
+          // 修复「粘贴总是先换行」的问题（详见 useHtmlImporter.splitInlineFirstHtml）
+          const { inlineJson, restHtml } = splitInlineFirstHtml(cleanedHtml)
+          insertInlineFirstContent(editor.value, pasteRange, inlineJson, restHtml)
           // 写入 htmlSource 元数据（用于焦点模式排版弹窗检测）
           // 注意：这里保存的是「原始」剪贴板 HTML（未清洗），供「恢复原样」使用
           editor.value?.commands?.setHtmlSource?.({
@@ -346,10 +355,25 @@ const editor = useEditor({
         return true
       }
 
-      // 3) 纯文本粘贴：检测 Markdown 标记，命中则推送排版提示
+      // 3) 纯文本粘贴：统一规范化后「内联优先」插入
+      //    默认 ProseMirror 管线会把首尾换行变成空段落、连续空行原样保留成串空行，
+      //    这里统一走 plainTextToEditableHtml（裁首尾空行、连续空行合并、\r\n 归一），
+      //    再拆成「首行内联 + 其余段落」，首行直接跟在光标后面不换行。
       const pastedText = event.clipboardData?.getData?.('text/plain') || ''
       if (pastedText) {
         notifyMarkdownDetected('paste', pastedText)
+
+        // 代码块内保持默认行为（原始文本直接插入），避免 <p> 破坏代码块结构
+        if (editor.value?.isActive?.('codeBlock')) {
+          return false
+        }
+
+        const html = plainTextToEditableHtml(pastedText)
+        if (html) {
+          const { inlineJson, restHtml } = splitInlineFirstHtml(html)
+          insertInlineFirstContent(editor.value, pasteRange, inlineJson, restHtml)
+          return true
+        }
       }
 
       return false
