@@ -2,6 +2,7 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { computePosition, flip, offset, shift } from '@floating-ui/dom'
 import { useThemeStore } from '@/stores/theme'
+import { plainTextToEditableHtml } from '@/composables/useHtmlImporter'
 
 const props = defineProps({
   open: {
@@ -79,7 +80,11 @@ async function handlePaste() {
   try {
     const text = await navigator.clipboard.readText()
     if (text) {
-      ed.chain().focus().insertContent(text).run()
+      // 纯文本需转换为段落/换行结构后再插入：
+      // 直接 insertContent(text) 会把 \n 作为字面量塞进单个文本节点，
+      // 导致换行视觉丢失、导出 markdown 时换行数量错乱。
+      const html = plainTextToEditableHtml(text)
+      ed.chain().focus().insertContent(html || text).run()
     }
   } catch {
     document.execCommand('paste')

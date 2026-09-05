@@ -65,6 +65,247 @@ export function detectHtmlInClipboard(clipboardData) {
 }
 
 /**
+ * 粘贴 HTML 清洗正则集合：
+ *  - CLIPBOARD_NOISE_RE    剪贴板包装噪音（注释 / meta / link / script / style / title / Word 的 <o:p>）
+ *  - TRAILING_BREAK_RE     块级元素闭合标签前的 <br> / &nbsp; / 空白（Word 风格 <p>line<br></p>）
+ *  - EMPTY_BLOCK_RE        内容仅含 <br> / &nbsp; / 空白的空块级元素（<p><br></p>、<div> </div>）
+ */
+const CLIPBOARD_NOISE_RE = [
+  /<!--[\s\S]*?-->/g, // HTML 注释（含 Chrome 的 StartFragment/EndFragment）
+  /<(script|style|title)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, // 成对出现的可丢弃节点
+  /<(meta|link)\b[^>]*\/?>/gi, // 自闭合的头部标签（<meta charset='utf-8'> 等）
+  /<\/?o:p\s*>/gi, // MS Word 命名空间标签（解包，内容保留）
+]
+
+const BLOCK_CLOSE_TAGS = 'p|div|h[1-6]|li|dt|dd|blockquote|section|article|aside|main|nav|figure|figcaption|td|th|pre|body|html'
+
+const TRAILING_BREAK_RE = new RegExp(
+  `(?:<br\\s*/?>|&nbsp;|\\s)+(?=\\s*</(?:${BLOCK_CLOSE_TAGS})\\b)`,
+  'gi',
+)
+
+const EMPTY_BLOCK_RE = new RegExp(
+  `<(p|div|h[1-6]|li|blockquote|section|article|aside)\\b[^>]*>(?:\\s|&nbsp;|<br\\s*/?>)*</\\1\\s*>`,
+  'gi',
+)
+
+/** 空块移除的最大迭代轮数（嵌套空块如 <div><p><br></p></div> 需要 2 轮） */
+const MAX_EMPTY_BLOCK_PASSES = 10
+
+/* ---------------------------------------------------------------------------
+ * DOM 级深度清洗（正则的盲区兜底）
+ *
+ * 字符串级正则无法处理「空白被嵌套内联标签包裹」的形态，例如：
+ *   <p><span>&nbsp;</span></p>、<div><span><br></span></div>、<li><b> </b></li>
+ * 这些会被 Tiptap 解析为空段落 → 粘贴后内容上方/中间出现成串空行。
+ * 故在字符串预清洗后追加 DOM 解析一遍，自底向上移除"视觉空块"。
+ * ------------------------------------------------------------------------- */
+
+/** 需要做首尾 <br>/空白修剪的容器选择器（含表格单元格，单元格本身不会被移除） */
+const DOM_ENDSTRIP_SELECTOR =
+  'p,div,h1,h2,h3,h4,h5,h6,li,dt,dd,blockquote,section,article,aside,main,nav,figure,figcaption,header,footer,pre,td,th'
+
+/** 允许被整体移除的"视觉空块"选择器（不含 td/th/pre，避免破坏表格/代码块结构） */
+const DOM_EMPTY_REMOVABLE_SELECTOR =
+  'p,div,h1,h2,h3,h4,h5,h6,li,dt,dd,blockquote,section,article,aside,main,nav,figure,figcaption,header,footer'
+
+/** 有实际内容含义、出现即认为块非空的元素 */
+const DOM_MEDIA_SELECTOR =
+  'img,video,audio,table,hr,iframe,svg,canvas,embed,object,input,textarea,select'
+
+/** 可作为"空块填充物"存在的内联格式标签（br / span / b / i 等） */
+const INLINE_NOISE_TAG_RE =
+  /^(?:BR|SPAN|B|I|EM|STRONG|U|S|STRIKE|DEL|INS|SMALL|SUB|SUP|FONT|A|CODE|MARK|ABBR|CITE|Q)$/
+
+/** 零宽字符（网页复制常见，ProseMirror 会当正文文本保留） */
+const ZERO_WIDTH_RE = /[\u200B-\u200D\uFEFF]/g
+
+/** 归一化文本：nbsp → 空格、去零宽字符，判断是否还有可见文本 */
+function hasVisibleText(el) {
+  const text = (el.textContent || '').replace(/\u00A0/g, ' ').replace(ZERO_WIDTH_RE, '')
+  return text.trim() !== ''
+}
+
+/** 判断块级元素是否为「视觉空块」（可安全整体移除） */
+function isRemovableEmptyBlock(el) {
+  if (el.querySelector(DOM_MEDIA_SELECTOR)) return false
+  if (hasVisibleText(el)) return false
+  // 后代元素必须全部是无内容含义的内联标签，否则视为承载结构
+  for (const child of el.querySelectorAll('*')) {
+    if (!INLINE_NOISE_TAG_RE.test(child.tagName)) return false
+  }
+  return true
+}
+
+/** 判断顶层首尾的节点是否为可修剪的"空白填充"（空白文本 / <br> / 空内联标签） */
+function isBlankPaddingNode(node) {
+  if (!node) return false
+  if (node.nodeType === 3 /* TEXT */) return !(node.textContent || '').trim()
+  if (node.nodeType !== 1 /* ELEMENT */) return false
+  if (node.tagName === 'BR') return true
+  if (INLINE_NOISE_TAG_RE.test(node.tagName)) {
+    return !hasVisibleText(node) && !node.querySelector(DOM_MEDIA_SELECTOR)
+  }
+  return false
+}
+
+/** 从容器两端修剪空白填充（尾端 <br> 会变成段尾 hardBreak、首端 <br> 会多出空行） */
+function trimBlankPadding(el) {
+  for (let guard = 0; guard < 200; guard += 1) {
+    const last = el.lastChild
+    if (isBlankPaddingNode(last)) {
+      last.remove()
+      continue
+    }
+    const first = el.firstChild
+    if (isBlankPaddingNode(first)) {
+      first.remove()
+      continue
+    }
+    break
+  }
+}
+
+/**
+ * DOM 深度清洗剪贴板内容（在字符串预清洗之后调用）。
+ * @param {DocumentFragment} root
+ */
+function domSanitizePastedContent(root) {
+  // a) 去除文本节点中的零宽字符（\u200B 等，会被解析为正文文本）
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
+  const textNodes = []
+  while (walker.nextNode()) textNodes.push(walker.currentNode)
+  for (const textNode of textNodes) {
+    const original = textNode.textContent || ''
+    const cleaned = original.replace(ZERO_WIDTH_RE, '')
+    if (cleaned !== original) {
+      if (cleaned) textNode.textContent = cleaned
+      else textNode.remove()
+    }
+  }
+
+  // b) 块级/容器/顶层两端修剪 <br>、空白、空内联标签
+  for (const el of [...root.querySelectorAll(DOM_ENDSTRIP_SELECTOR), root]) {
+    trimBlankPadding(el)
+  }
+
+  // c) 迭代移除「视觉空块」，自底向上消化嵌套（<div><p><br></p></div>）
+  for (let pass = 0; pass < MAX_EMPTY_BLOCK_PASSES; pass += 1) {
+    let removed = false
+    for (const el of [...root.querySelectorAll(DOM_EMPTY_REMOVABLE_SELECTOR)]) {
+      if (isRemovableEmptyBlock(el)) {
+        el.remove()
+        removed = true
+      }
+    }
+    if (!removed) break
+  }
+}
+
+/**
+ * 清洗粘贴进来的剪贴板 HTML，消除「粘贴后多出多个换行符/空行/大片空白」问题。
+ *
+ * 常见来源（网页 / Word / 微信 / ChatGPT）的剪贴板 HTML 带有四类噪音：
+ *   1. 段落末尾的 <br>（Word 风格 <p>line<br></p>）→ Tiptap 解析为段尾 hardBreak
+ *   2. 空块（<p><br></p>、<div> </div>、<p>&nbsp;</p>）→ 解析为空段落（可见空行）
+ *   3. 注释 / meta / <o:p> 等剪贴板包装噪音
+ *   4. 嵌套内联标签包裹的空白（<p><span>&nbsp;</span></p>、<div><span><br></span></div>）
+ *      → 正则盲区，需 DOM 级深度清洗（本函数第 3 步）
+ *
+ * 注意：调用方仍应把「原始 HTML」存入 doc.attrs.htmlSource（供「恢复原样」使用），
+ * 本函数只服务于插入渲染。
+ *
+ * @param {string | null | undefined} htmlString
+ * @returns {string}
+ */
+export function sanitizePastedHtml(htmlString) {
+  if (!htmlString || typeof htmlString !== 'string') return ''
+
+  let html = htmlString
+
+  // 1) 剥离剪贴板包装噪音（注释、meta/link、script/style/title、<o:p>）
+  for (const re of CLIPBOARD_NOISE_RE) {
+    html = html.replace(re, '')
+  }
+
+  // 2) 去掉块级元素闭合标签前的 <br> / &nbsp; / 纯空白（字符串级快速通道）
+  html = html.replace(TRAILING_BREAK_RE, '')
+
+  // 3) DOM 级深度清洗：嵌套内联包裹的空白块、块首尾 <br>、零宽字符
+  if (typeof document !== 'undefined') {
+    try {
+      const template = document.createElement('template')
+      template.innerHTML = html
+      domSanitizePastedContent(template.content)
+      html = template.innerHTML
+    } catch (e) {
+      // DOM 解析失败（极端畸形 HTML）：退回字符串级结果
+    }
+  }
+
+  // 4) 字符串级空块移除兜底（无 DOM 环境或解析异常时生效）
+  for (let i = 0; i < MAX_EMPTY_BLOCK_PASSES; i += 1) {
+    const next = html.replace(EMPTY_BLOCK_RE, '')
+    if (next === html) break
+    html = next
+  }
+
+  return html.trim()
+}
+
+/**
+ * 判断（清洗后的）粘贴 HTML 是否还有任何可见内容。
+ * 用于「粘贴内容全是空白」时静默吞掉粘贴：不插入、不弹「已插入」提示。
+ * @param {string | null | undefined} html
+ * @returns {boolean}
+ */
+export function pastedHtmlHasVisibleContent(html) {
+  if (!html || typeof html !== 'string') return false
+
+  if (typeof document !== 'undefined') {
+    try {
+      const template = document.createElement('template')
+      template.innerHTML = html
+      if (template.content.querySelector(DOM_MEDIA_SELECTOR)) return true
+      return hasVisibleText(template.content)
+    } catch (e) {
+      // fall through 到字符串级判断
+    }
+  }
+
+  const withoutTags = html.replace(/<[^>]*>/g, ' ')
+  return withoutTags.replace(/\u00A0/g, ' ').replace(ZERO_WIDTH_RE, '').trim() !== ''
+}
+
+/**
+ * 把纯文本转换为可插入编辑器的 HTML 片段（右键菜单「粘贴」用）。
+ *
+ * 背景：直接 insertContent(纯文本) 会把 \n 作为字面量塞进单个文本节点，
+ * 视觉上换行丢失；而 markdown 序列化又把字面量 \n 原样输出，造成
+ * 「导出后换行数量错乱」。此处按纯文本语义正确转换：
+ *   - 空行（\n{2,}）分段 → <p>
+ *   - 段内单个换行 → <br>
+ *
+ * @param {string | null | undefined} text
+ * @returns {string}
+ */
+export function plainTextToEditableHtml(text) {
+  if (!text || typeof text !== 'string') return ''
+
+  // 统一 Windows/Mac 换行符；去掉首尾空行（粘贴时不产生多余空段落）
+  const normalized = text.replace(/\r\n?/g, '\n').replace(/^\n+|\n+$/g, '')
+  if (!normalized) return ''
+
+  const escapeHtmlText = (s) =>
+    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+
+  return normalized
+    .split(/\n{2,}/)
+    .map((para) => `<p>${escapeHtmlText(para).replace(/\n/g, '<br>')}</p>`)
+    .join('')
+}
+
+/**
  * 校验 HTML 源码大小是否在阈值内。
  * @param {string} htmlString
  * @returns {{ ok: boolean, bytes?: number, error?: string }}
@@ -310,6 +551,9 @@ export function useHtmlImporter() {
     updateHtmlSource,
     restoreFromHtmlSource,
     getFormatState,
+    sanitizePastedHtml,
+    plainTextToEditableHtml,
+    pastedHtmlHasVisibleContent,
   }
 }
 
@@ -325,5 +569,8 @@ export default {
   restoreFromHtmlSource,
   getFormatState,
   useHtmlImporter,
+  sanitizePastedHtml,
+  plainTextToEditableHtml,
+  pastedHtmlHasVisibleContent,
   MAX_HTML_SOURCE_BYTES,
 }

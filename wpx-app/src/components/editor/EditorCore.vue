@@ -49,6 +49,8 @@ import { useMarkdownFormatPromptStore } from '@/stores/markdownFormatPrompt'
 import {
   extractHtmlFromClipboard,
   hasHtmlImport,
+  sanitizePastedHtml,
+  pastedHtmlHasVisibleContent,
 } from '@/composables/useHtmlImporter'
 import { useHtmlFormatPromptStore } from '@/stores/htmlFormatPrompt'
 import { getSanitizedJson } from '@/utils/exportAttrsFilter'
@@ -312,8 +314,21 @@ const editor = useEditor({
         try {
           // 在光标位置插入 HTML，保留文档原有内容
           // 注意：必须使用完整可选链避免 editor.value 为 null 时抛 TypeError
-          editor.value?.chain()?.focus()?.insertContent(htmlContent)?.run()
+          // 先清洗再插入：去除段尾 <br>、空段落、嵌套内联包裹的空白（&nbsp; 段）等噪音，
+          // 避免「粘贴后多出多个换行符/大片空白」（详见 useHtmlImporter.sanitizePastedHtml）
+          const cleanedHtml = sanitizePastedHtml(htmlContent)
+          if (!pastedHtmlHasVisibleContent(cleanedHtml)) {
+            // 粘贴内容全是空白（空段落/nbsp/零宽字符）：静默吞掉，
+            // 不插入任何内容、不写 htmlSource、不弹「已插入」提示
+            return true
+          }
+          editor.value
+            ?.chain()
+            ?.focus()
+            ?.insertContent(cleanedHtml)
+            ?.run()
           // 写入 htmlSource 元数据（用于焦点模式排版弹窗检测）
+          // 注意：这里保存的是「原始」剪贴板 HTML（未清洗），供「恢复原样」使用
           editor.value?.commands?.setHtmlSource?.({
             htmlSource: htmlContent,
             sourceUrl: null,
