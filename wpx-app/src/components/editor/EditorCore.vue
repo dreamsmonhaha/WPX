@@ -361,7 +361,8 @@ const editor = useEditor({
       //    再拆成「首行内联 + 其余段落」，首行直接跟在光标后面不换行。
       const pastedText = event.clipboardData?.getData?.('text/plain') || ''
       if (pastedText) {
-        notifyMarkdownDetected('paste', pastedText)
+        // 注意：粘贴不再自动触发「MD 智能排版」对话（用户反馈粘贴 MD 文档时
+        // 弹窗打扰）。排版仍可通过 AI 助理输入「排版」或打开 MD 文件触发。
 
         // 代码块内保持默认行为（原始文本直接插入），避免 <p> 破坏代码块结构
         if (editor.value?.isActive?.('codeBlock')) {

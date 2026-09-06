@@ -1,6 +1,6 @@
 {
   "name": "wpx",
-  "version": "0.1.36",
+  "version": "0.1.40",
   "description": "WPX - AI 智能文档编辑器，多窗口 Electron + Vue3 应用",
   "author": {
     "name": "WPX Team",
@@ -141,6 +141,14 @@
       {
         "from": "resources/bin/pandoc",
         "to": "bin/pandoc"
+      },
+      {
+        "from": "resources/bin",
+        "to": "bin",
+        "filter": [
+          "*",
+          "!pandoc/**"
+        ]
       }
     ],
     "asarUnpack": [
